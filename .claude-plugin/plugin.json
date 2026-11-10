@@ -1,0 +1,24 @@
+{
+  "name": "yriist",
+  "displayName": "ЮрИИст",
+  "version": "1.0.0",
+  "description": "ЮрИИст — ИИ-юрист по праву РФ внутри Claude: судебная практика, нормы с проверкой актуальности, контрагенты, расчёты неустойки, госпошлины и сроков, ваши чаты, документы и сроки. Вход через OAuth.",
+  "author": {
+    "name": "ЮрИИст",
+    "email": "support@yriist.ru",
+    "url": "https://yriist.ru"
+  },
+  "homepage": "https://yriist.ru",
+  "repository": "https://github.com/Yriist/yriist-claude-plugin",
+  "license": "MIT",
+  "keywords": [
+    "legal",
+    "law",
+    "russia",
+    "юрист",
+    "судебная практика",
+    "mcp"
+  ],
+  "types": "./types/index.d.ts",
+  "privacyPolicyUrl": "https://yriist.ru/privacy"
+}

@@ -1,0 +1,22 @@
+{
+  "name": "yriist",
+  "owner": {
+    "name": "ЮрИИст",
+    "email": "support@yriist.ru",
+    "url": "https://yriist.ru"
+  },
+  "description": "Плагины ЮрИИста для Claude Code.",
+  "plugins": [
+    {
+      "name": "yriist",
+      "source": "./",
+      "description": "ИИ-юрист по праву РФ: практика, нормы, контрагенты, расчёты, ваши чаты, документы и сроки ЮрИИста.",
+      "category": "productivity",
+      "tags": [
+        "legal",
+        "russia",
+        "mcp"
+      ]
+    }
+  ]
+}

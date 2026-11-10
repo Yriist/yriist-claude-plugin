@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Token helper
+        run: sh tests/mcp-headers.test.sh
+      - name: Manifests are valid JSON and agree
+        run: |
+          node -e '
+            const plugin = require("./.claude-plugin/plugin.json");
+            const market = require("./.claude-plugin/marketplace.json");
+            require("./.mcp.json");
+            require("./hooks/hooks.json");
+            const entry = market.plugins.find((item) => item.name === plugin.name);
+            if (!entry) { console.error("marketplace.json does not list the plugin"); process.exit(1); }
+          '
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Validate the plugin (manifest, hooks module, state contract)
+        run: claude plugin validate .
+      - name: Hooks module tests
+        run: claude plugin test .
