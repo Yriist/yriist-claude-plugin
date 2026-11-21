@@ -1,7 +1,13 @@
 ---
-description: Проверка контрагента — карточка, реквизиты, риски, суды
+description: Проверка контрагента: карточка, реквизиты, суды, риски
 argument-hint: <ИНН | ОГРН | название>
-allowed-tools: mcp__plugin_yriist_yriist__company_lookup, mcp__plugin_yriist_yriist__company_check, mcp__plugin_yriist_yriist__requisites_lookup, mcp__plugin_yriist_yriist__court_search
+allowed-tools: mcp__plugin_yriist_yriist__company_lookup, mcp__plugin_yriist_yriist__requisites_lookup, mcp__plugin_yriist_yriist__court_search, mcp__plugin_yriist_yriist__web_fetch
 ---
 
-Проверь контрагента «$ARGUMENTS»: `company_lookup` (карточка), `company_check` (риски; если недоступно на тарифе — скажи об этом), `court_search` по названию или ИНН (споры). Итог: можно ли работать, красные флаги, что запросить у контрагента.
+Проверь контрагента «$ARGUMENTS».
+
+1. `company_lookup` найдёт карточку: полное наименование, ИНН и ОГРН, адрес, руководителя, статус, дату регистрации. Банковские реквизиты ищи `requisites_lookup`.
+2. Споры: `court_search` с `party`. Передай название из карточки без организационно-правовой формы и кавычек, ИНН не подойдёт. Открой 1–2 показательных акта через `web_fetch`.
+3. `company_check`: платная проверка рисков, доступна не на всех тарифах, Claude Code спросит разрешение. Вызывай, когда пользователь просит проверить риски или карточка и суды уже показали тревожные признаки. Тариф не позволяет: скажи об этом.
+
+Итог: можно ли работать, красные флаги, что запросить у контрагента перед сделкой.

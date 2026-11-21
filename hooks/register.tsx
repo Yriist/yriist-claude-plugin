@@ -1,46 +1,74 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
 import type {
   YriistAccount,
   YriistChat,
   YriistDeadline,
   YriistLink,
+  YriistMeter,
 } from '../types'
 
 /**
  * ЮрИИст in Claude Code's own interface:
- * - a status line entry: plan, messages left, deadlines that burn;
- * - a band above the prompt when a deadline is overdue or ≤ 3 days away;
- * - a «ЮрИИст» pane (`/yriist-panel`): account, deadlines with «Готово»,
- *   recent chats you can pull into the conversation;
+ * - a status line entry: plan, usage, deadlines that burn;
+ * - a band above the prompt when a deadline is overdue or close;
+ * - a «ЮрИИст» pane (`/yriist-panel`): account, deadlines with «Готово» and
+ *   «Вернуть», recent chats you can pull into the conversation;
  * - a label under every ЮрИИст tool row («ЮрИИст · Судебная практика»).
  *
  * Every call goes through the plugin's own MCP server with Claude Code's
  * connection and credentials (`$.mcp.call`), so OAuth sign-in is the only
  * sign-in. Nothing is drawn until the server answers.
+ *
+ * Background reads are kept few: account and deadlines are cached in
+ * `$.store` and shared by every session, re-read when the cache is older
+ * than the refresh interval (60 min by default); chats only when the pane
+ * opens. Each call counts as MCP usage on the server.
  */
 
 const PANE = 'yriist'
-/** Account and deadlines are re-read this often; chats only when asked for. */
-const REFRESH_MS = 30 * 60 * 1000
+/** Opening the pane re-reads account and deadlines older than this. */
+const PANE_STALE_MS = 5 * 60 * 1000
 /** MCP tool names of this server: as a plugin server or added by hand. */
 const TOOL_PREFIX = /^mcp__(?:plugin_yriist_)?yriist__/
+/** The cache every session shares; the suffix changes with its shape. */
+const SNAPSHOT_KEY = 'snapshot-2'
 
 const link = atom({ plugin: 'yriist', key: 'link' } as const, { state: 'unknown' } as YriistLink, {
   shape: 'link-1',
 })
 const account = atom({ plugin: 'yriist', key: 'account' } as const, null as YriistAccount | null, {
-  shape: 'account-1',
+  shape: 'account-2',
 })
 const deadlines = atom({ plugin: 'yriist', key: 'deadlines' } as const, [] as YriistDeadline[], {
-  shape: 'deadlines-1',
+  shape: 'deadlines-2',
 })
 const chats = atom({ plugin: 'yriist', key: 'chats' } as const, [] as YriistChat[], {
-  shape: 'chats-1',
+  shape: 'chats-2',
 })
 const bandHiddenFor = atom({ plugin: 'yriist', key: 'bandHiddenFor' } as const, '')
 const doneIds = atom({ plugin: 'yriist', key: 'doneIds' } as const, [] as string[])
+const lastDone = atom(
+  { plugin: 'yriist', key: 'lastDone' } as const,
+  null as { id: string; title: string } | null,
+  { shape: 'last-done-1' },
+)
+
+/** The person's choices (`userConfig`), read again on every reload. */
+type Settings = { statusLine: boolean; band: boolean; bandDays: number; refreshMs: number }
+let settings: Settings = { statusLine: true, band: true, bandDays: 3, refreshMs: 60 * 60 * 1000 }
+
+function settingsFrom(options: PluginOptions): Settings {
+  const number = (value: unknown, fallback: number, min: number, max: number) =>
+    typeof value === 'number' && Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback
+  return {
+    statusLine: options.status_line !== false,
+    band: options.deadline_band !== false,
+    bandDays: number(options.band_days, 3, 0, 30),
+    refreshMs: number(options.refresh_minutes, 60, 10, 1440) * 60 * 1000,
+  }
+}
 
 /** Russian titles of the server's tools, for the row label and toasts. */
 const TITLES: Record<string, string> = {
@@ -49,17 +77,45 @@ const TITLES: Record<string, string> = {
   chats_list: 'Чаты',
   chat_read: 'Чат',
   chats_search: 'Поиск по чатам',
+  chat_stop: 'Остановить ответ',
+  chat_delete: 'Удалить чат',
+  projects_list: 'Дела',
+  project_read: 'Дело',
+  project_create: 'Новое дело',
+  project_update: 'Изменить дело',
+  project_delete: 'Удалить дело',
+  files_list: 'Файлы',
+  file_read: 'Файл',
+  file_upload: 'Загрузка файла',
+  file_upload_begin: 'Загрузка файла',
+  file_upload_finish: 'Загрузка файла',
   documents_list: 'Документы',
   document_read: 'Документ',
+  document_versions: 'Версии документа',
   document_create: 'Новый документ',
+  document_edit: 'Правка документа',
+  document_update: 'Изменить документ',
+  document_restore: 'Вернуть версию',
+  document_export: 'Скачать документ',
+  document_delete: 'Удалить документ',
   templates_search: 'Шаблоны',
   template_read: 'Шаблон',
   document_from_template: 'Документ из шаблона',
   deadlines_list: 'Сроки',
-  deadline_complete: 'Срок выполнен',
   deadline_save: 'Сохранить срок',
-  cases_list: 'Дела',
+  deadline_update: 'Изменить срок',
+  deadline_delete: 'Удалить срок',
+  deadline_complete: 'Срок выполнен',
+  cases_list: 'Судебные дела',
+  case_read: 'Карточка судебного дела',
   case_track: 'Мониторинг дела',
+  case_update: 'Изменить мониторинг',
+  case_check: 'Проверить дело',
+  case_delete: 'Снять с мониторинга',
+  review_tables_list: 'Табличный анализ',
+  review_table_read: 'Табличный анализ',
+  review_table_create: 'Новый табличный анализ',
+  anonymize: 'Обезличивание',
   web_search: 'Поиск в интернете',
   web_fetch: 'Чтение источника',
   court_search: 'Судебная практика',
@@ -74,14 +130,25 @@ const TITLES: Record<string, string> = {
   calculate_court_fee: 'Госпошлина',
   calculate_deadline: 'Процессуальный срок',
   calculate: 'Расчёт',
+  memory_list: 'Память',
   memory_search: 'Память',
   memory_save: 'Запоминаю',
   memory_delete: 'Забываю',
-  skill_read: 'Навык',
 }
 
 /** Tools after which the register (deadlines) or the account changed. */
-const TOUCHES_DEADLINES = new Set(['deadline_save', 'deadline_complete', 'case_track'])
+const TOUCHES_DEADLINES = new Set([
+  'deadline_save',
+  'deadline_update',
+  'deadline_delete',
+  'deadline_complete',
+  'case_track',
+  'case_update',
+  'case_check',
+  'case_delete',
+  'project_delete',
+  'ask_yriist',
+])
 const TOUCHES_ACCOUNT = new Set(['ask_yriist'])
 
 function shortTool(name: string): string | null {
@@ -123,7 +190,41 @@ function ruDate(iso: string): string {
   return match ? `${match[3]}.${match[2]}.${match[1]}` : iso
 }
 
+const percentText = (value: number) => `${Math.round(value)}%`
+
+/** The status line's usage part; null when the plan has no limit. */
+function usageShort(acc: YriistAccount): string | null {
+  switch (acc.meter.kind) {
+    case 'messages':
+      return acc.messagesLeft === null
+        ? null
+        : `${acc.messagesLeft} ${plural(acc.messagesLeft, 'сообщение', 'сообщения', 'сообщений')}`
+    case 'budget':
+    case 'tokens':
+      return `использовано ${percentText(acc.meter.percent)}`
+    default:
+      return null
+  }
+}
+
+/** The pane's usage line. */
+function usageLine(acc: YriistAccount): string {
+  switch (acc.meter.kind) {
+    case 'messages':
+      return acc.messagesLeft === null
+        ? 'Сообщения: без лимита'
+        : `Сообщений осталось: ${acc.messagesLeft} из ${acc.messagesLimit}`
+    case 'budget':
+    case 'tokens':
+      return `Использовано в этом месяце: ${percentText(acc.meter.percent)} лимита тарифа`
+    default:
+      return 'Без лимита в этом месяце'
+  }
+}
+
 const SIGN_IN = 'Войдите в ЮрИИст: /mcp → yriist → Authenticate'
+/** An error that means «sign in», not «something broke». */
+const SIGNED_OUT_ERROR = /\b401\b|unauthori[sz]ed|needs? auth|authenticat|sign[- ]?in required/i
 
 /** Why the server isn't connected, in the person's words. */
 const REFUSALS: Record<string, string> = {
@@ -135,6 +236,8 @@ const REFUSALS: Record<string, string> = {
 
 /** The server's name as `$.mcp.call` takes it; null while it isn't connected. */
 let serverName: string | null = null
+/** The pane was opened in this session: keep its chats fresh too. */
+let chatsWanted = false
 
 type ServerLookup =
   | { ok: true; name: string }
@@ -208,7 +311,7 @@ async function callTool(
     return { ok: true, data }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    const signedOut = /401|unauthori[sz]ed|auth/i.test(message)
+    const signedOut = SIGNED_OUT_ERROR.test(message)
     // Ask the engine again next time: the server may have been reconnected.
     serverName = null
     return {
@@ -219,18 +322,31 @@ async function callTool(
   }
 }
 
+function parseMeter(data: Record<string, unknown>, messagesLimit: number): YriistMeter {
+  const meter = asRecord(data.meter)
+  const kind = str(meter.kind)
+  const percent = Math.min(100, Math.max(0, num(data.usagePercent, num(meter.percent))))
+  if (kind === 'messages' || kind === 'budget' || kind === 'tokens' || kind === 'none') {
+    return { kind, percent }
+  }
+  // A server from before the meter: a message cap or nothing.
+  return { kind: messagesLimit >= 0 ? 'messages' : 'none', percent }
+}
+
 function parseAccount(data: Record<string, unknown>): YriistAccount {
   const user = asRecord(data.user)
   const plan = asRecord(data.plan)
   const links = asRecord(data.links)
+  const messagesLimit = num(data.messagesLimit, -1)
   return {
     name: str(user.name),
-    contact: str(user.contact) || null,
     plan: str(plan.name) || 'ЮрИИст',
+    meter: parseMeter(data, messagesLimit),
     messagesLeft: typeof data.messagesLeft === 'number' ? data.messagesLeft : null,
-    messagesLimit: num(data.messagesLimit, -1),
+    messagesLimit,
     messagesUsed: num(data.messagesUsed),
     chatAllowed: data.chatAllowed !== false,
+    chatReason: str(data.chatReason) || null,
     links: {
       app: str(links.app) || 'https://app.yriist.ru/chat',
       billing: str(links.billing) || 'https://app.yriist.ru/billing',
@@ -251,6 +367,7 @@ function parseDeadlines(data: Record<string, unknown>): YriistDeadline[] {
       legalBasis: str(item.legalBasis) || null,
       caseNumber: str(item.caseNumber) || null,
       status: str(item.status) || 'open',
+      needsConfirmation: item.needsConfirmation === true,
     }
   })
 }
@@ -259,17 +376,20 @@ function parseChats(data: Record<string, unknown>): YriistChat[] {
   const items = Array.isArray(data.items) ? data.items : []
   return items.slice(0, 8).map((raw) => {
     const item = asRecord(raw)
+    const actions = Array.isArray(item.actions) ? item.actions : null
     return {
       id: str(item.id),
       title: str(item.title) || 'Без названия',
       date: str(item.date),
       url: str(item.url),
+      // The server marks a chat hidden on the free plan by offering no action.
+      locked: item.locked === true || (actions !== null && actions.length === 0),
     }
   })
 }
 
 function urgent(list: readonly YriistDeadline[]): YriistDeadline[] {
-  return list.filter((item) => item.status === 'open' && item.daysLeft <= 3)
+  return list.filter((item) => item.status === 'open' && item.daysLeft <= settings.bandDays)
 }
 
 /**
@@ -283,7 +403,43 @@ function bandKey(hot: readonly YriistDeadline[]): string {
     .join(',')
 }
 
+// ── The cache shared by sessions ───────────────────────────────────────────
+
+type Snapshot = { at: number; account: YriistAccount; deadlines: YriistDeadline[] }
+
+async function loadSnapshot($: EngineInterface): Promise<Snapshot | null> {
+  const value = asRecord(await $.store.get(SNAPSHOT_KEY).catch(() => undefined))
+  const acc = asRecord(value.account)
+  if (typeof value.at !== 'number' || !Array.isArray(value.deadlines) || !asRecord(acc.meter).kind) {
+    return null
+  }
+  return value as unknown as Snapshot
+}
+
+async function saveSnapshot($: EngineInterface): Promise<void> {
+  const acc = await read($, account)
+  if (!acc || (await read($, link)).state !== 'connected') return
+  const snapshot: Snapshot = { at: await $.clock.now(), account: acc, deadlines: await read($, deadlines) }
+  await $.store.set(SNAPSHOT_KEY, snapshot).catch(() => {})
+}
+
+/** Takes another session's fresh read instead of asking the server. */
+async function adoptSnapshot($: EngineInterface, maxAgeMs: number): Promise<boolean> {
+  const snapshot = await loadSnapshot($)
+  if (!snapshot || (await $.clock.now()) - snapshot.at >= maxAgeMs) return false
+  await update($, account, () => snapshot.account)
+  await update($, deadlines, () => snapshot.deadlines)
+  await update($, link, () => ({ state: 'connected', updatedAt: snapshot.at }) as YriistLink)
+  return true
+}
+
+// ── Reads ──────────────────────────────────────────────────────────────────
+
 async function paintStatus($: EngineInterface): Promise<void> {
+  if (!settings.statusLine) {
+    $.ui.status(undefined)
+    return
+  }
   const state = await read($, link)
   if (state.state === 'signed_out') {
     $.ui.status('ЮрИИст: войдите — /mcp')
@@ -295,13 +451,12 @@ async function paintStatus($: EngineInterface): Promise<void> {
     return
   }
   const parts = [`ЮрИИст · ${acc.plan}`]
-  if (acc.messagesLeft !== null) {
-    parts.push(`${acc.messagesLeft} ${plural(acc.messagesLeft, 'сообщение', 'сообщения', 'сообщений')}`)
-  }
+  const usage = usageShort(acc)
+  if (usage) parts.push(usage)
   const hot = urgent(await read($, deadlines))
   const overdue = hot.filter((item) => item.daysLeft < 0).length
   if (overdue > 0) parts.push(`просрочено сроков: ${overdue}`)
-  else if (hot.length > 0) parts.push(`сроков ≤3 дн.: ${hot.length}`)
+  else if (hot.length > 0) parts.push(`сроков ≤${settings.bandDays} дн.: ${hot.length}`)
   $.ui.status(parts.join(' · '))
 }
 
@@ -322,6 +477,7 @@ async function refreshDeadlines($: EngineInterface): Promise<void> {
   if (outcome.ok) {
     await update($, deadlines, () => parseDeadlines(outcome.data))
     await update($, doneIds, () => [])
+    await saveSnapshot($)
   }
 }
 
@@ -332,7 +488,7 @@ async function refreshChats($: EngineInterface): Promise<void> {
 
 let refreshing: Promise<void> | null = null
 
-function refreshAll($: EngineInterface, withChats = true): Promise<void> {
+function refreshAll($: EngineInterface, withChats = chatsWanted): Promise<void> {
   refreshing ??= (async () => {
     try {
       await refreshAccount($)
@@ -347,22 +503,55 @@ function refreshAll($: EngineInterface, withChats = true): Promise<void> {
   return refreshing
 }
 
-export const register: Register = (on) => {
+/** Account and deadlines, unless a session read them less than `maxAgeMs` ago. */
+async function refreshIfStale($: EngineInterface, maxAgeMs: number): Promise<void> {
+  if (await adoptSnapshot($, maxAgeMs)) {
+    if (chatsWanted) await refreshChats($)
+    await paintStatus($)
+    return
+  }
+  await refreshAll($)
+}
+
+/** The pane is wanted: chats too, and account and deadlines when stale. */
+async function openPane($: EngineInterface): Promise<void> {
+  chatsWanted = true
+  await $.ui.open({ id: PANE, title: 'ЮрИИст' })
+  void refreshIfStale($, PANE_STALE_MS)
+}
+
+/** Marks a deadline in the pane: done, or back to open («Вернуть»). */
+async function setDeadline($: EngineInterface, item: { id: string; title: string }, status: 'done' | 'open') {
+  if (status === 'done') await update($, doneIds, (ids) => [...ids, item.id])
+  const outcome = await callTool($, 'deadline_update', { deadline_id: item.id, status })
+  if (outcome.ok) {
+    $.ui.toast(status === 'done' ? `Срок «${item.title}» выполнен` : `Срок «${item.title}» снова в работе`)
+    await update($, lastDone, () => (status === 'done' ? { id: item.id, title: item.title } : null))
+    await refreshDeadlines($)
+    await paintStatus($)
+  } else {
+    if (status === 'done') await update($, doneIds, (ids) => ids.filter((id) => id !== item.id))
+    $.ui.toast(outcome.message)
+  }
+}
+
+export const register: Register = (on, options) => {
+  settings = settingsFrom(options)
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'yriist-panel',
       description: 'Панель ЮрИИста: аккаунт, сроки, последние чаты',
     })
-    void refreshAll($)
-    $.clock.every(REFRESH_MS, () => {
-      void refreshAll($, false)
+    void refreshIfStale($, settings.refreshMs)
+    $.clock.every(settings.refreshMs, () => {
+      void refreshIfStale($, settings.refreshMs)
     })
     return next(e)
   })
 
   on('command.run', { command: 'yriist-panel' }, async ($) => {
-    await $.ui.open({ id: PANE, title: 'ЮрИИст' })
-    void refreshAll($)
+    await openPane($)
     return { text: 'Панель ЮрИИста открыта.' }
   })
 
@@ -376,9 +565,16 @@ export const register: Register = (on) => {
       void refreshDeadlines($).then(() => paintStatus($))
     }
     if (TOUCHES_ACCOUNT.has(tool)) {
-      if (!failed) $.ui.toast('ЮрИИст ответил — чат сохранён в приложении')
-      void refreshAccount($).then(() => paintStatus($))
-      void refreshChats($)
+      if (!failed) {
+        const running = /"status"\s*:\s*"running"/.test(String(('text' in ran && ran.text) || ''))
+        $.ui.toast(
+          running
+            ? 'ЮрИИст ещё отвечает — ответ появится в чате приложения'
+            : 'ЮрИИст ответил — чат сохранён в приложении',
+        )
+      }
+      void refreshAccount($).then(() => saveSnapshot($)).then(() => paintStatus($))
+      if (chatsWanted) void refreshChats($)
     }
     if ((await read($, link)).state !== 'connected' && !failed) {
       void refreshAll($)
@@ -417,7 +613,7 @@ export const register: Register = (on) => {
 
   // A band above the prompt while a deadline burns.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey) return next(e)
+    if (!settings.band || e.props.hasSurvey) return next(e)
     const done = new Set(await read($, doneIds))
     const hot = urgent(await read($, deadlines)).filter((item) => !done.has(item.id))
     if (hot.length === 0 || (await read($, bandHiddenFor)) === bandKey(hot)) return next(e)
@@ -437,7 +633,7 @@ export const register: Register = (on) => {
           key="open"
           label="Сроки"
           onPress={() => {
-            void $.ui.open({ id: PANE, title: 'ЮрИИст' })
+            void openPane($)
           }}
         />
         <Button
@@ -459,9 +655,11 @@ export const register: Register = (on) => {
     const done = new Set(await read($, doneIds))
     const list = (await read($, deadlines)).filter((item) => item.status === 'open')
     const recent = await read($, chats)
+    const undo = await read($, lastDone)
     const width = Math.max(20, e.props.bodyColumns)
     const hot = urgent(list).filter((item) => !done.has(item.id))
     const isBandHidden = hot.length > 0 && (await read($, bandHiddenFor)) === bandKey(hot)
+    const shown = list.slice(0, 12)
 
     if (state.state === 'signed_out' || !acc) {
       return (
@@ -474,7 +672,7 @@ export const register: Register = (on) => {
                 ? state.message
                 : 'Подключаюсь к ЮрИИсту…'}
           </Text>
-          <Button key="retry" label="Проверить снова" onPress={() => void refreshAll($)} />
+          <Button key="retry" label="Проверить снова" onPress={() => void refreshAll($, true)} />
         </Box>
       )
     }
@@ -486,14 +684,10 @@ export const register: Register = (on) => {
             <Text weight="semibold">{acc.name || 'ЮрИИст'}</Text>
             <Text color="claude">{acc.plan}</Text>
           </Box>
-          {acc && (
-            <Text dimColor>
-              {acc.messagesLeft === null
-                ? 'Сообщения: без лимита'
-                : `Сообщений осталось: ${acc.messagesLeft} из ${acc.messagesLimit}`}
-              {acc.chatAllowed ? '' : ' · вопросы ИИ-юристу недоступны'}
-            </Text>
-          )}
+          <Text dimColor wrap="wrap">
+            {usageLine(acc)}
+            {acc.chatAllowed ? '' : ` · вопросы ИИ-юристу недоступны${acc.chatReason ? `: ${acc.chatReason}` : ''}`}
+          </Text>
           {state.state === 'error' && (
             <Text color="error" wrap="wrap">
               {state.message}
@@ -504,9 +698,10 @@ export const register: Register = (on) => {
         <Box flexDirection="column">
           <Text weight="semibold">Сроки</Text>
           {list.length === 0 && <Text dimColor>Открытых сроков нет.</Text>}
-          {list.slice(0, 12).map((item) => {
+          {shown.map((item) => {
             const isDone = done.has(item.id)
-            const color = item.daysLeft < 0 ? 'error' : item.daysLeft <= 3 ? 'warning' : 'success'
+            const color =
+              item.daysLeft < 0 ? 'error' : item.daysLeft <= settings.bandDays ? 'warning' : 'success'
             return (
               <Box key={item.id} flexDirection="row" gap={1}>
                 <Text color={isDone ? 'inactive' : color}>{ruDate(item.dueDate)}</Text>
@@ -519,56 +714,72 @@ export const register: Register = (on) => {
                     {item.caseNumber ? ` · дело ${item.caseNumber}` : ''}
                     {item.legalBasis ? ` · ${item.legalBasis}` : ''}
                   </Text>
+                  {item.needsConfirmation && (
+                    <Text color="warning" wrap="truncate-end">
+                      дата начала не подтверждена — проверьте её
+                    </Text>
+                  )}
                 </Box>
                 {!isDone && (
                   <Button
                     key={`done-${item.id}`}
                     label="Готово"
                     onPress={() => {
-                      void (async () => {
-                        await update($, doneIds, (ids) => [...ids, item.id])
-                        const outcome = await callTool($, 'deadline_complete', {
-                          deadline_id: item.id,
-                          status: 'done',
-                        })
-                        if (outcome.ok) {
-                          $.ui.toast(`Срок «${item.title}» выполнен`)
-                          await refreshDeadlines($)
-                          await paintStatus($)
-                        } else {
-                          await update($, doneIds, (ids) => ids.filter((id) => id !== item.id))
-                          $.ui.toast(outcome.message)
-                        }
-                      })()
+                      void setDeadline($, item, 'done')
                     }}
                   />
                 )}
               </Box>
             )
           })}
+          {list.length > shown.length && (
+            <Text dimColor>
+              и ещё {list.length - shown.length} — все сроки: /yriist:deadlines
+            </Text>
+          )}
+          {undo && (
+            <Box flexDirection="row" gap={1}>
+              <Text dimColor wrap="truncate-end">
+                {`«${undo.title}» отмечен выполненным`}
+              </Text>
+              <Button
+                key={`undo-${undo.id}`}
+                label="Вернуть"
+                onPress={() => {
+                  void setDeadline($, undo, 'open')
+                }}
+              />
+            </Box>
+          )}
         </Box>
 
         <Box flexDirection="column">
           <Text weight="semibold">Последние чаты</Text>
           {recent.length === 0 && <Text dimColor>Чатов пока нет.</Text>}
-          {recent.map((chat) => (
-            <Button
-              key={`chat-${chat.id}`}
-              plain
-              onPress={() => {
-                void $.prompt.fill({
-                  text: `Прочитай мой чат ЮрИИста «${chat.title}» (chat_read, chat_id ${chat.id}) и `,
-                })
-              }}
-            >
-              {chat.title}
-              <Text dimColor> {ruDate(chat.date.slice(0, 10))}</Text>
-            </Button>
-          ))}
+          {recent.map((chat) =>
+            chat.locked ? (
+              <Text key={`chat-${chat.id}`} dimColor wrap="truncate-end">
+                {`${chat.title} · закрыт на бесплатном тарифе`}
+              </Text>
+            ) : (
+              <Button
+                key={`chat-${chat.id}`}
+                plain
+                onPress={() => {
+                  void $.prompt.fill({
+                    text: `Прочитай мой чат ЮрИИста «${chat.title}» (chat_read, chat_id ${chat.id}) и `,
+                  })
+                }}
+              >
+                {chat.title}
+                <Text dimColor> {ruDate(chat.date.slice(0, 10))}</Text>
+              </Button>
+            ),
+          )}
         </Box>
 
         <Box flexDirection="row" gap={1} flexWrap="wrap">
-          <Button key="refresh" label="Обновить" onPress={() => void refreshAll($)} />
+          <Button key="refresh" label="Обновить" onPress={() => void refreshAll($, true)} />
           <Button
             key="ask"
             label="Спросить ИИ-юриста"

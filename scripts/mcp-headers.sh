@@ -10,6 +10,11 @@
 # file is the way; $YRIIST_TOKEN is still read for other runners.
 # A configured Authorization header turns Claude Code's OAuth off for this
 # server, so set a token only when you want token mode.
+#
+# Why not `userConfig` with `sensitive: true` + `${user_config.KEY}` in
+# .mcp.json `headers`: a static Authorization header disables OAuth even when
+# the value is empty, and a headersHelper can't read user_config values. So
+# the optional token stays a file, read here. Keep it that way.
 
 token="${YRIIST_TOKEN:-}"
 if [ -z "$token" ]; then

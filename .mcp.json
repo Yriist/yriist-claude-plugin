@@ -3,7 +3,8 @@
     "yriist": {
       "type": "http",
       "url": "${YRIIST_MCP_URL:-https://app.yriist.ru/api/mcp}",
-      "headersHelper": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/mcp-headers.sh\""
+      "headersHelper": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/mcp-headers.sh\"",
+      "timeout": 300000
     }
   }
 }
